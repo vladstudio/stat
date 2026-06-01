@@ -1,5 +1,5 @@
 #!/bin/bash
 set -e
 cd "$(dirname "$0")"
-source ../scripts/release-kit.sh
+source ../app-scripts/release-kit.sh
 release_app "Stat" --info app/Stat/Info.plist

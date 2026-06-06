@@ -8,10 +8,6 @@ Tiny menu bar app that shows CPU, GPU, temperature, network speed, and weekday a
 
 ## Install
 
-[Download Stat.zip](https://github.com/vladstudio/stat/releases/latest/download/Stat.zip), unzip, and move to Applications.
-
-Or via terminal:
-
 ```sh
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/vladstudio/stat/main/install.sh)"
 ```

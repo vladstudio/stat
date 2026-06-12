@@ -6,6 +6,8 @@ Tiny menu bar app that shows CPU, GPU, temperature, network speed, and weekday a
 
 <img src="web/screenshot.webp" alt="Screenshot">
 
+Requires macOS 15 (Sequoia) or later.
+
 ## Install
 
 1. Open **Terminal** (press ⌘Space, type "Terminal", press Enter)

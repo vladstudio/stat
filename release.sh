@@ -1,5 +1,6 @@
 #!/bin/bash
-set -e
-cd "$(dirname "$0")"
+set -e; cd "$(dirname "$0")"
+source ./app.sh
+source ../app-scripts/build-kit.sh
 source ../app-scripts/release-kit.sh
-release_app "Stat" --info app/Stat/Info.plist
+release_app

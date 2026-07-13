@@ -2,7 +2,7 @@
 
 <img src="stat-1024.png" width="128" alt="Stat icon">
 
-Tiny menu bar app that shows CPU, GPU, temperature, network speed, and weekday at a glance.
+Tiny menu bar app that shows the single heaviest CPU process %, GPU utilization %, temperature, network speed, and weekday at a glance.
 
 <img src="web/screenshot.webp" alt="Screenshot">
 

@@ -28,9 +28,8 @@ struct Stats {
 
 @MainActor
 final class SystemStats {
-    private let hostPort = mach_host_self()
-    private var prevCPUInfo: processor_info_array_t?
-    private var prevCPUCount: mach_msg_type_number_t = 0
+    private var prevCPUTicks: [pid_t: UInt64] = [:]
+    private var prevCPUWall: UInt64 = 0
     private var prevNetIn: UInt64 = 0
     private var prevNetOut: UInt64 = 0
     private var hasBaseline = false
@@ -64,10 +63,8 @@ final class SystemStats {
 
     func invalidateBaseline() {
         hasBaseline = false
-        if let prev = prevCPUInfo {
-            vm_deallocate(mach_task_self_, vm_address_t(bitPattern: prev), vm_size_t(prevCPUCount) * vm_size_t(MemoryLayout<integer_t>.stride))
-            prevCPUInfo = nil
-        }
+        prevCPUTicks.removeAll()
+        prevCPUWall = 0
     }
 
     func read() -> Stats {
@@ -86,62 +83,68 @@ final class SystemStats {
         return stats
     }
 
-    // MARK: - CPU
+    // MARK: - CPU (top process %)
 
     private func readCPU() -> Int {
-        var numCPUs: natural_t = 0
-        var cpuInfo: processor_info_array_t?
-        var cpuInfoCount: mach_msg_type_number_t = 0
+        let now = mach_absolute_time()
+        let wallDelta = now - prevCPUWall
 
-        let result = host_processor_info(
-            hostPort,
-            PROCESSOR_CPU_LOAD_INFO,
-            &numCPUs,
-            &cpuInfo,
-            &cpuInfoCount
-        )
-        guard result == KERN_SUCCESS, let cpuInfo else { return 0 }
+        let bufSize = proc_listallpids(nil, 0)
+        guard bufSize > 0 else { return 0 }
+        let buf = UnsafeMutablePointer<pid_t>.allocate(capacity: Int(bufSize))
+        defer { buf.deallocate() }
+        let actualCount = proc_listallpids(buf, bufSize)
+        guard actualCount > 0 else { return 0 }
 
-        var totalUser: Int64 = 0, totalSystem: Int64 = 0, totalIdle: Int64 = 0, totalNice: Int64 = 0
-        var prevTotalUser: Int64 = 0, prevTotalSystem: Int64 = 0, prevTotalIdle: Int64 = 0, prevTotalNice: Int64 = 0
-
-        for i in 0..<Int(numCPUs) {
-            let offset = Int(CPU_STATE_MAX) * i
-            totalUser += Int64(cpuInfo[offset + Int(CPU_STATE_USER)])
-            totalSystem += Int64(cpuInfo[offset + Int(CPU_STATE_SYSTEM)])
-            totalIdle += Int64(cpuInfo[offset + Int(CPU_STATE_IDLE)])
-            totalNice += Int64(cpuInfo[offset + Int(CPU_STATE_NICE)])
-
-            if let prev = prevCPUInfo {
-                prevTotalUser += Int64(prev[offset + Int(CPU_STATE_USER)])
-                prevTotalSystem += Int64(prev[offset + Int(CPU_STATE_SYSTEM)])
-                prevTotalIdle += Int64(prev[offset + Int(CPU_STATE_IDLE)])
-                prevTotalNice += Int64(prev[offset + Int(CPU_STATE_NICE)])
+        // First call — establish baseline
+        guard prevCPUWall > 0, wallDelta > 0 else {
+            for i in 0..<Int(actualCount) {
+                let pid = buf[i]
+                guard pid > 0 else { continue }
+                var info = proc_taskinfo()
+                let size = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, Int32(MemoryLayout<proc_taskinfo>.stride))
+                guard size > 0 else { continue }
+                prevCPUTicks[pid] = info.pti_total_user + info.pti_total_system
             }
+            prevCPUWall = now
+            return 0
         }
 
-        var load = 0
-        if let _ = prevCPUInfo {
-            let userDelta = totalUser - prevTotalUser
-            let systemDelta = totalSystem - prevTotalSystem
-            let idleDelta = totalIdle - prevTotalIdle
-            let niceDelta = totalNice - prevTotalNice
-            let total = userDelta + systemDelta + idleDelta + niceDelta
-            if total > 0 {
-                load = Int(((Double(userDelta + systemDelta + niceDelta)) / Double(total)) * 100)
+        var maxPct = 0
+        var seen = Set<pid_t>()
+
+        for i in 0..<Int(actualCount) {
+            let pid = buf[i]
+            guard pid > 0 else { continue }
+            seen.insert(pid)
+
+            var info = proc_taskinfo()
+            let size = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, Int32(MemoryLayout<proc_taskinfo>.stride))
+            guard size > 0 else { continue }
+
+            let total = info.pti_total_user + info.pti_total_system
+            if let prev = prevCPUTicks[pid] {
+                let delta = total - prev
+                if delta > 0, delta < wallDelta * 64 {
+                    let pct = Int((Double(delta) / Double(wallDelta)) * 100)
+                    if pct > maxPct { maxPct = pct }
+                }
             }
+            prevCPUTicks[pid] = total
         }
 
-        if let prev = prevCPUInfo {
-            vm_deallocate(mach_task_self_, vm_address_t(bitPattern: prev), vm_size_t(prevCPUCount) * vm_size_t(MemoryLayout<integer_t>.stride))
+        // Remove zombie PIDs
+        for pid in prevCPUTicks.keys where !seen.contains(pid) {
+            prevCPUTicks.removeValue(forKey: pid)
         }
-        prevCPUInfo = cpuInfo
-        prevCPUCount = cpuInfoCount
 
-        return load
+        prevCPUWall = now
+        return maxPct
     }
 
-    // MARK: - GPU
+    // MARK: - GPU (aggregate utilization)
+    // Per-process GPU % is not available through public APIs on macOS.
+    // We read the aggregate GPU Device Utilization % from IOAccelerator.
 
     private func readGPU() -> Int {
         var iterator: io_iterator_t = 0
@@ -149,20 +152,20 @@ final class SystemStats {
         guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else { return 0 }
         defer { IOObjectRelease(iterator) }
 
+        var maxPct = 0
         var entry = IOIteratorNext(iterator)
         while entry != 0 {
             var props: Unmanaged<CFMutableDictionary>?
             if IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
                let dict = props?.takeRetainedValue() as? [String: Any],
                let perfStats = dict["PerformanceStatistics"] as? [String: Any] {
-                let util = gpuUtil(from: perfStats)
-                IOObjectRelease(entry)
-                return util
+                let pct = gpuUtil(from: perfStats)
+                if pct > maxPct { maxPct = pct }
             }
             IOObjectRelease(entry)
             entry = IOIteratorNext(iterator)
         }
-        return 0
+        return maxPct
     }
 
     private func gpuUtil(from stats: [String: Any]) -> Int {

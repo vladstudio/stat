@@ -1,3 +1,4 @@
+#if DEBUG
 import Foundation
 import CIOHIDPrivate
 
@@ -59,3 +60,4 @@ print(String(format: "SoC max (CPU/GPU die): %6.2f °C  (across %d sensors)", so
 if let hottest = socTemps.max(by: { $0.value < $1.value }) {
     print("  hottest: \(hottest.key)")
 }
+#endif

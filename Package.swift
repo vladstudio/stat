@@ -12,11 +12,21 @@ let package = Package(
             name: "CIOHIDPrivate",
             path: "app/CIOHIDPrivate"
         ),
+        .target(
+            name: "StatKit",
+            dependencies: ["CIOHIDPrivate"],
+            path: "app/StatKit"
+        ),
         .executableTarget(
             name: "Stat",
-            dependencies: [.product(name: "MacAppKit", package: "app-kit"), "CIOHIDPrivate"],
+            dependencies: [.product(name: "MacAppKit", package: "app-kit"), "StatKit"],
             path: "app/Stat",
             exclude: ["Info.plist"]
+        ),
+        .testTarget(
+            name: "StatKitTests",
+            dependencies: ["StatKit"],
+            path: "Tests/StatKitTests"
         ),
         .executableTarget(
             name: "TempTest",

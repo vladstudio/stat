@@ -1,5 +1,6 @@
 import Cocoa
 import CoreText
+import StatKit
 
 enum StatBlock: String, CaseIterable {
     case cpu = "CPU"
@@ -16,7 +17,6 @@ final class StatusItemView: NSView {
     var stats = Stats() { didSet { updateWidth(); needsDisplay = true } }
     var visibleBlocks = Set(StatBlock.allCases) { didSet { updateWidth(); needsDisplay = true } }
 
-    private var oswaldFont: NSFont!
     private var iconCPU: NSImage!
     private var iconGPU: NSImage!
     private var iconTemp: NSImage!
@@ -35,7 +35,16 @@ final class StatusItemView: NSView {
     private let numberY: CGFloat = 6
     private let minBlockW: CGFloat = 16
     private let blockGap: CGFloat = 8
-    private let fontSize: CGFloat = 11
+
+    // Menu bar number font; register the bundled font for this process first.
+    private let oswaldFont: NSFont = {
+        if let url = Bundle.main.url(forResource: "Oswald-Light", withExtension: "ttf") {
+            CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+        }
+        return NSFont(name: "Oswald", size: 11)
+            ?? NSFont(name: "Oswald-Light", size: 11)
+            ?? .monospacedDigitSystemFont(ofSize: 11, weight: .light)
+    }()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -48,13 +57,6 @@ final class StatusItemView: NSView {
     }
 
     private func loadResources() {
-        if let fontURL = Bundle.main.url(forResource: "Oswald-Light", withExtension: "ttf") {
-            CTFontManagerRegisterFontsForURL(fontURL as CFURL, .process, nil)
-        }
-        oswaldFont = NSFont(name: "Oswald", size: fontSize)
-            ?? NSFont(name: "Oswald-Light", size: fontSize)
-            ?? NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .light)
-
         iconCPU = loadIcon("cpu")
         iconGPU = loadIcon("gpu")
         iconTemp = loadIcon("temp")
@@ -77,7 +79,7 @@ final class StatusItemView: NSView {
     }
 
     private func textWidth(_ text: String) -> CGFloat {
-        let attrs: [NSAttributedString.Key: Any] = [.font: oswaldFont!]
+        let attrs: [NSAttributedString.Key: Any] = [.font: oswaldFont]
         return ceil((text as NSString).size(withAttributes: attrs).width)
     }
 
@@ -125,7 +127,7 @@ final class StatusItemView: NSView {
         let color = menuBarColor
 
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: oswaldFont!,
+            .font: oswaldFont,
             .foregroundColor: color,
         ]
 

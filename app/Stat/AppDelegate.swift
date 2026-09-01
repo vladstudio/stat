@@ -1,12 +1,14 @@
 import Cocoa
 import MacAppKit
+import StatKit
 
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var statusView: StatusItemView!
     private var systemStats: SystemStats!
-    private var timer: Timer?
+    private var sampler: Task<Void, Never>?
+    private var sleepObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         systemStats = SystemStats()
@@ -42,18 +44,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusItem.menu = menu
 
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.systemStats.invalidateBaseline() }
-        }
-
-        // Initial read (establishes baseline for network deltas)
-        statusView.stats = systemStats.read()
-
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        // Token must be retained or the observation is silently cancelled
+        sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.statusView.stats = self.systemStats.read()
+                Task { await self.systemStats.invalidateBaseline() }
+            }
+        }
+
+        // Sample via the SystemStats actor: syscalls run off the main thread,
+        // view updates hop back to main. First read establishes the baseline.
+        sampler = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let stats = await self.systemStats.read()
+                self.statusView.stats = stats
                 self.statusItem.length = self.statusView.frame.width
+                try? await Task.sleep(for: .seconds(1))
             }
         }
     }

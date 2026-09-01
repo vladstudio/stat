@@ -1,15 +1,23 @@
 import Foundation
 import IOKit
+import os
 import CIOHIDPrivate
 
-struct Stats {
-    var cpuLoad: Int = 0
-    var gpuLoad: Int = 0
-    var temperature: Int = 0
-    var downloadBytesPerSec: UInt64 = 0
-    var uploadBytesPerSec: UInt64 = 0
+// kIOHIDEventTypeTemperature (Apple vendor page, undocumented)
+private let kIOHIDEventTypeTemperature: Int64 = 15
 
-    var downloadDisplay: (value: String, isMega: Bool) {
+private let log = Logger(subsystem: "studio.vlad.stat", category: "SystemStats")
+
+public struct Stats: Sendable {
+    public init() {}
+
+    public var cpuLoad: Int = 0
+    public var gpuLoad: Int = 0
+    public var temperature: Int = 0
+    public var downloadBytesPerSec: UInt64 = 0
+    public var uploadBytesPerSec: UInt64 = 0
+
+    public var downloadDisplay: (value: String, isMega: Bool) {
         let kbps = downloadBytesPerSec / 1024
         if kbps >= 1000 {
             return (String(format: "%.2f", Double(kbps) / 1024.0), true)
@@ -17,7 +25,7 @@ struct Stats {
         return ("\(kbps)", false)
     }
 
-    var uploadDisplay: (value: String, isMega: Bool) {
+    public var uploadDisplay: (value: String, isMega: Bool) {
         let kbps = uploadBytesPerSec / 1024
         if kbps >= 1000 {
             return (String(format: "%.2f", Double(kbps) / 1024.0), true)
@@ -26,18 +34,20 @@ struct Stats {
     }
 }
 
-@MainActor
-final class SystemStats {
+/// Actor: read() is invoked from the menu bar UI but runs its syscalls
+/// off the main thread; no state is shared with callers.
+public actor SystemStats {
     private var prevCPUTicks: [pid_t: UInt64] = [:]
     private var prevCPUWall: UInt64 = 0
     private var prevNetIn: UInt64 = 0
     private var prevNetOut: UInt64 = 0
     private var hasBaseline = false
 
+    // Client must stay alive for the service clients to remain valid.
     private let tempClient: AnyObject?
     private let tempServices: [AnyObject]
 
-    init() {
+    public init() {
         let matching: [String: Any] = [
             "PrimaryUsagePage": 0xff00,
             "PrimaryUsage": 0x0005,
@@ -57,17 +67,18 @@ final class SystemStats {
                 }
             }
         }
+        if sensors.isEmpty { log.error("no temperature sensors matched — temperature will read 0") }
         self.tempClient = client
         self.tempServices = sensors
     }
 
-    func invalidateBaseline() {
+    public func invalidateBaseline() {
         hasBaseline = false
         prevCPUTicks.removeAll()
         prevCPUWall = 0
     }
 
-    func read() -> Stats {
+    public func read() -> Stats {
         var stats = Stats()
         stats.cpuLoad = readCPU()
         stats.gpuLoad = readGPU()
@@ -80,10 +91,19 @@ final class SystemStats {
         prevNetIn = netIn
         prevNetOut = netOut
         hasBaseline = true
+        log.debug("cpu=\(stats.cpuLoad) gpu=\(stats.gpuLoad) temp=\(stats.temperature) down=\(stats.downloadBytesPerSec) up=\(stats.uploadBytesPerSec)")
         return stats
     }
 
     // MARK: - CPU (top process %)
+
+    /// One process's CPU % over the wall-time window. A recycled PID reports
+    /// fewer ticks than its predecessor — clamped to 0 to avoid UInt64 underflow.
+    static func cpuPercent(total: UInt64, prev: UInt64, wallDelta: UInt64) -> Int {
+        let delta = total > prev ? total - prev : 0
+        guard wallDelta > 0, delta > 0, delta < wallDelta * 64 else { return 0 }
+        return Int((Double(delta) / Double(wallDelta)) * 100)
+    }
 
     private func readCPU() -> Int {
         let now = mach_absolute_time()
@@ -93,12 +113,17 @@ final class SystemStats {
         guard bufSize > 0 else { return 0 }
         let buf = UnsafeMutablePointer<pid_t>.allocate(capacity: Int(bufSize))
         defer { buf.deallocate() }
-        let actualCount = proc_listallpids(buf, bufSize)
-        guard actualCount > 0 else { return 0 }
+        let listed = proc_listallpids(buf, bufSize)
+        guard listed > 0 else {
+            log.error("proc_listallpids: \(listed)")
+            return 0
+        }
+        // The pid list can grow between the two calls — clamp to the allocation.
+        let count = min(listed, bufSize)
 
         // First call — establish baseline
         guard prevCPUWall > 0, wallDelta > 0 else {
-            for i in 0..<Int(actualCount) {
+            for i in 0..<Int(count) {
                 let pid = buf[i]
                 guard pid > 0 else { continue }
                 var info = proc_taskinfo()
@@ -113,7 +138,7 @@ final class SystemStats {
         var maxPct = 0
         var seen = Set<pid_t>()
 
-        for i in 0..<Int(actualCount) {
+        for i in 0..<Int(count) {
             let pid = buf[i]
             guard pid > 0 else { continue }
             seen.insert(pid)
@@ -124,12 +149,8 @@ final class SystemStats {
 
             let total = info.pti_total_user + info.pti_total_system
             if let prev = prevCPUTicks[pid] {
-                // PID reuse can make total < prev — avoid UInt64 underflow
-                let delta = total > prev ? total - prev : 0
-                if delta > 0, delta < wallDelta * 64 {
-                    let pct = Int((Double(delta) / Double(wallDelta)) * 100)
-                    if pct > maxPct { maxPct = pct }
-                }
+                let pct = Self.cpuPercent(total: total, prev: prev, wallDelta: wallDelta)
+                if pct > maxPct { maxPct = pct }
             }
             prevCPUTicks[pid] = total
         }
@@ -160,7 +181,7 @@ final class SystemStats {
             if IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
                let dict = props?.takeRetainedValue() as? [String: Any],
                let perfStats = dict["PerformanceStatistics"] as? [String: Any] {
-                let pct = gpuUtil(from: perfStats)
+                let pct = Self.gpuUtil(from: perfStats)
                 if pct > maxPct { maxPct = pct }
             }
             IOObjectRelease(entry)
@@ -169,7 +190,8 @@ final class SystemStats {
         return maxPct
     }
 
-    private func gpuUtil(from stats: [String: Any]) -> Int {
+    /// IOAccelerator stats keys are undocumented and vary by GPU generation — try known keys, then anything utilization-shaped.
+    static func gpuUtil(from stats: [String: Any]) -> Int {
         if let v = stats["GPU Activity(%)"] as? Int { return v }
         if let v = stats["Device Utilization %"] as? Int { return v }
         if let v = stats["GPU Core Utilization"] as? Int { return v }
@@ -185,8 +207,8 @@ final class SystemStats {
     private func readTemperature() -> Int {
         var maxTemp: Double = 0
         for svc in tempServices {
-            guard let event = IOHIDServiceClientCopyEvent(svc, 15, 0, 0) else { continue }
-            let t = IOHIDEventGetFloatValue(event, 15 << 16)
+            guard let event = IOHIDServiceClientCopyEvent(svc, kIOHIDEventTypeTemperature, 0, 0) else { continue }
+            let t = IOHIDEventGetFloatValue(event, Int32(kIOHIDEventTypeTemperature << 16))
             if t > -100, t < 200, t > maxTemp { maxTemp = t }
         }
         return Int(maxTemp.rounded())
@@ -197,18 +219,26 @@ final class SystemStats {
     private func readNetBytes() -> (UInt64, UInt64) {
         var mib = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
         var len: size_t = 0
-        guard sysctl(&mib, 6, nil, &len, nil, 0) == 0 else { return (0, 0) }
+        guard sysctl(&mib, 6, nil, &len, nil, 0) == 0 else {
+            log.error("sysctl iflist size: \(String(cString: strerror(errno)))")
+            return (0, 0)
+        }
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: len)
         defer { buf.deallocate() }
-        guard sysctl(&mib, 6, buf, &len, nil, 0) == 0 else { return (0, 0) }
+        guard sysctl(&mib, 6, buf, &len, nil, 0) == 0 else {
+            log.error("sysctl iflist: \(String(cString: strerror(errno)))")
+            return (0, 0)
+        }
 
         var totalIn: UInt64 = 0, totalOut: UInt64 = 0
         var ptr = UnsafeMutableRawPointer(buf)
         let end = ptr + len
         while ptr < end {
             let hdr = ptr.assumingMemoryBound(to: if_msghdr.self).pointee
+            guard hdr.ifm_msglen > 0 else { break } // zero-length message would spin forever
             if hdr.ifm_type == RTM_IFINFO2 {
                 let hdr2 = ptr.assumingMemoryBound(to: if_msghdr2.self).pointee
+                // All non-loopback interfaces — VPN tunnels double-count their underlying interface
                 if hdr2.ifm_data.ifi_type != UInt8(IFT_LOOP) {
                     totalIn += hdr2.ifm_data.ifi_ibytes
                     totalOut += hdr2.ifm_data.ifi_obytes

@@ -124,7 +124,8 @@ final class SystemStats {
 
             let total = info.pti_total_user + info.pti_total_system
             if let prev = prevCPUTicks[pid] {
-                let delta = total - prev
+                // PID reuse can make total < prev — avoid UInt64 underflow
+                let delta = total > prev ? total - prev : 0
                 if delta > 0, delta < wallDelta * 64 {
                     let pct = Int((Double(delta) / Double(wallDelta)) * 100)
                     if pct > maxPct { maxPct = pct }
